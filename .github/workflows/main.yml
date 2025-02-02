@@ -1,0 +1,182 @@
+name: Build and Release TermiOS
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '14.0'
+
+      - name: Setup Ruby and Bundle
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.0'
+          bundler-cache: true
+
+      - name: Cache Pods
+        uses: actions/cache@v3
+        with:
+          path: Pods
+          key: ${{ runner.os }}-pods-${{ hashFiles('**/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Install CocoaPods
+        run: |
+          gem install cocoapods
+          pod install --repo-update
+
+      - name: Set Build Number
+        run: |
+          buildNumber=$(date -u "+%Y%m%d%H%M")
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $buildNumber" "TermiOS/Info.plist"
+
+      - name: Create Temporary Keychain
+        run: |
+          security create-keychain -p "temporary" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "temporary" build.keychain
+          security set-keychain-settings -t 3600 -l build.keychain
+
+      - name: Build for Development
+        run: |
+          xcodebuild \
+            -workspace TermiOS.xcworkspace \
+            -scheme TermiOS \
+            -configuration Release \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+      - name: Create IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/TermiOS.app Payload/
+          zip -r TermiOS.ipa Payload
+          rm -rf Payload
+
+      - name: Generate Release Notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "# Release Notes" > ReleaseNotes.md
+          echo "## What's New" >> ReleaseNotes.md
+          echo "- Build Number: $(date -u '+%Y%m%d%H%M')" >> ReleaseNotes.md
+          echo "- Release Date: $(date -u '+%Y-%m-%d')" >> ReleaseNotes.md
+          git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:"- %s" >> ReleaseNotes.md
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            TermiOS.ipa
+            ReleaseNotes.md
+          body_path: ReleaseNotes.md
+          draft: false
+          prerelease: false
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: TermiOS-Build-${{ github.run_number }}
+          path: |
+            TermiOS.ipa
+            ReleaseNotes.md
+          retention-days: 30
+
+      - name: Upload Debug Symbols
+        uses: actions/upload-artifact@v3
+        with:
+          name: TermiOS-dSYM-${{ github.run_number }}
+          path: build/Build/Products/Release-iphoneos/*.dSYM
+          retention-days: 30
+
+      - name: Cleanup Build
+        if: always()
+        run: |
+          security delete-keychain build.keychain
+          rm -rf build
+          rm -f TermiOS.ipa
+          rm -f ReleaseNotes.md
+          pod deintegrate
+          rm -rf Pods
+          rm -rf ~/Library/Developer/Xcode/DerivedData
+
+  test:
+    name: Run Tests
+    runs-on: macos-latest
+    needs: build
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '14.0'
+
+      - name: Install CocoaPods
+        run: |
+          gem install cocoapods
+          pod install
+
+      - name: Run Tests
+        run: |
+          xcodebuild test \
+            -workspace TermiOS.xcworkspace \
+            -scheme TermiOS \
+            -destination 'platform=iOS Simulator,name=iPhone 14,OS=16.0' \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO
+
+  analyze:
+    name: Static Analysis
+    runs-on: macos-latest
+    needs: test
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '14.0'
+
+      - name: Install SwiftLint
+        run: brew install swiftlint
+
+      - name: Run SwiftLint
+        run: swiftlint lint --reporter github-actions-logging
+
+      - name: Run Xcode Analysis
+        run: |
+          xcodebuild analyze \
+            -workspace TermiOS.xcworkspace \
+            -scheme TermiOS \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO
